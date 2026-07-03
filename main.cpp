@@ -135,29 +135,39 @@ std::string Base64Encode(const std::string& data) {
 
 // Build the StableHLO wrapper with the correct Mosaic backend_config format.
 // The JSON shape comes from jaxlib's `CustomCallBackendConfig.to_json()`:
-//     {"custom_call_config": {"body": "<base64>"}}
+//     {"custom_call_config": {"body": "<base64>", "needs_layout_passes": true}}
 //
 // The body is the Mosaic MLIR bytes (text is accepted by ir.Module.parse,
 // though jaxlib normally feeds bytecode). We try text first; if libtpu
 // rejects it we'd need a bytecode pre-processing step.
+//
+// `needs_layout_passes: true` is what Pallas/as_tpu_kernel sets by default
+// (tpu_custom_call.py: `needs_layout_passes or not device_type`). It tells
+// libtpu to run the full Mosaic pipeline — infer-memref-layout,
+// infer-vector-layout, apply-vector-layout — over the kernel. Without it,
+// libtpu skips layout inference and rejects plain memrefs with "All memref
+// arguments should use the TiledLayoutAttr for layout". With it, we can feed
+// plain untiled memrefs exactly as the modular repo's Mosaic dumps do, and
+// Mosaic assigns the native (8,128) f32 tiling itself.
 std::string WrapMosaicInStableHlo(const std::string& mosaic_text) {
     const std::string body_b64 = Base64Encode(mosaic_text);
     // Inner JSON; escape the embedded quotes for the MLIR string literal.
     const std::string json =
         std::string("{\\\"custom_call_config\\\": {\\\"body\\\": \\\"")
-        + body_b64 + "\\\"}}";
+        + body_b64
+        + "\\\", \\\"needs_layout_passes\\\": true}}";
 
     return
         "module @wrapper {\n"
         "  func.func @main(\n"
-        "      %lhs: tensor<8x128xf32>,\n"
-        "      %rhs: tensor<8x128xf32>\n"
-        "  ) -> tensor<8x128xf32> {\n"
+        "      %lhs: tensor<3x3xf32>,\n"      // A
+        "      %rhs: tensor<3x3xf32>\n"       // B
+        "  ) -> tensor<3x3xf32> {\n"
         "    %out = stablehlo.custom_call @tpu_custom_call(%lhs, %rhs) {\n"
         "      backend_config = \"" + json + "\",\n"
         "      api_version = 2 : i32\n"
-        "    } : (tensor<8x128xf32>, tensor<8x128xf32>) -> tensor<8x128xf32>\n"
-        "    return %out : tensor<8x128xf32>\n"
+        "    } : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xf32>\n"
+        "    return %out : tensor<3x3xf32>\n"
         "  }\n"
         "}\n";
 }
@@ -423,20 +433,30 @@ int main(int argc, char** argv) {
     }
 
     // ---- 7. Prepare host-side inputs ----------------------------------
-    constexpr size_t ROWS = 8;
-    constexpr size_t COLS = 128;
-    constexpr size_t N = ROWS * COLS;  // 1024
-    std::vector<float> host_lhs(N), host_rhs(N);
-    for (size_t i = 0; i < N; ++i) {
-        host_lhs[i] = static_cast<float>(i);
-        host_rhs[i] = 1.0f;
-    }
+    // Compute C = A @ B, with A (M x K) and B (K x N), all 3x3.
+    constexpr size_t M = 3;   // A rows / C rows
+    constexpr size_t K = 3;   // shared (contraction) dim
+    constexpr size_t NN = 3;  // B cols / C cols
+
+    // A is row-major M x K, B is row-major K x N. Fill A[m][k] = m+1 (constant
+    // across k) and B[k][n] = n+1 (constant across k). Then
+    //   C[m][n] = sum_{k=0..K-1} (m+1)(n+1) = K*(m+1)(n+1) = 3*(m+1)(n+1).
+    std::vector<float> host_a(M * K), host_b(K * NN);
+    for (size_t m = 0; m < M; ++m)
+        for (size_t k = 0; k < K; ++k)
+            host_a[m * K + k] = static_cast<float>(m + 1);
+    for (size_t k = 0; k < K; ++k)
+        for (size_t n = 0; n < NN; ++n)
+            host_b[k * NN + n] = static_cast<float>(n + 1);
 
     // ---- 8. Upload inputs to device -----------------------------------
-    auto upload = [&](const std::vector<float>& host_data)
+    // Wrapper params are tensor<3x3xf32> (A) and tensor<3x3xf32> (B), so
+    // upload 2D buffers. PJRT/XLA applies the native tiled layout (T(8,128))
+    // and handles any padding on device; the host data stays dense row-major.
+    auto upload = [&](const std::vector<float>& host_data, int rows, int cols)
         -> PJRT_Buffer* {
-        int64_t dims[] = {static_cast<int64_t>(ROWS),
-                          static_cast<int64_t>(COLS)};
+        int64_t dims[] = {static_cast<int64_t>(rows),
+                          static_cast<int64_t>(cols)};
 
         PJRT_Client_BufferFromHostBuffer_Args args{};
         args.struct_size =
@@ -467,10 +487,11 @@ int main(int argc, char** argv) {
         return args.buffer;
     };
 
-    PJRT_Buffer* buf_lhs = upload(host_lhs);
-    PJRT_Buffer* buf_rhs = upload(host_rhs);
+    PJRT_Buffer* buf_lhs = upload(host_a, M, K);   // A (3x3)
+    PJRT_Buffer* buf_rhs = upload(host_b, K, NN);  // B (3x3)
     if (buf_lhs == nullptr || buf_rhs == nullptr) return 1;
-    std::cout << "[7] Uploaded 2 x " << N << " floats to device\n";
+    std::cout << "[7] Uploaded A (" << M << "x" << K << ") and B ("
+              << K << "x" << NN << ") to device\n";
 
     // ---- 9. Execute ---------------------------------------------------
     PJRT_Buffer* output_buffers[1] = {nullptr};
@@ -504,7 +525,38 @@ int main(int argc, char** argv) {
     std::cout << "[8] Executed kernel\n";
 
     // ---- 10. Download output ------------------------------------------
-    std::vector<float> host_out(N);
+    // DIAGNOSTIC: ask PJRT what the output buffer actually is, so we don't
+    // assume a compact 3x3. Print its logical dims and the exact byte size
+    // PJRT wants to write into host memory (queried via dst=nullptr).
+    {
+        PJRT_Buffer_Dimensions_Args dim_args{};
+        dim_args.struct_size = PJRT_Buffer_Dimensions_Args_STRUCT_SIZE;
+        dim_args.buffer = output_buffers[0];
+        if (CheckError(api, api->PJRT_Buffer_Dimensions(&dim_args),
+                       "PJRT_Buffer_Dimensions")) {
+            std::cout << "[dbg] output buffer dims = [";
+            for (size_t i = 0; i < dim_args.num_dims; ++i)
+                std::cout << (i ? "," : "") << dim_args.dims[i];
+            std::cout << "] (num_dims=" << dim_args.num_dims << ")\n";
+        }
+
+        PJRT_Buffer_ToHostBuffer_Args probe{};
+        probe.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
+        probe.src = output_buffers[0];
+        probe.host_layout = nullptr;
+        probe.dst = nullptr;  // ask PJRT for the size it needs
+        probe.dst_size = 0;
+        if (CheckError(api, api->PJRT_Buffer_ToHostBuffer(&probe),
+                       "PJRT_Buffer_ToHostBuffer (size probe)")) {
+            std::cout << "[dbg] PJRT wants dst_size = " << probe.dst_size
+                      << " bytes (" << probe.dst_size / sizeof(float)
+                      << " floats); we allocated " << (3 * 3) << " floats\n";
+        }
+    }
+
+    // Output is the (3x3) matmul result, i.e. 9 elements — not N.
+    constexpr size_t OUT_N = 3 * 3;
+    std::vector<float> host_out(OUT_N);
     {
         PJRT_Buffer_ToHostBuffer_Args args{};
         args.struct_size = PJRT_Buffer_ToHostBuffer_Args_STRUCT_SIZE;
@@ -524,13 +576,25 @@ int main(int argc, char** argv) {
     std::cout << "[9] Downloaded output\n\n";
 
     // ---- 11. Show results ---------------------------------------------
-    std::cout << "Result (first 8 elements):\n  ";
-    for (int i = 0; i < 8; ++i) {
+    // Reference C = A @ B on the host (A row-major MxK, B row-major KxN).
+    std::vector<float> expected(M * NN, 0.0f);
+    for (size_t m = 0; m < M; ++m) {
+        for (size_t n = 0; n < NN; ++n) {
+            float acc = 0.0f;
+            for (size_t k = 0; k < K; ++k) {
+                acc += host_a[m * K + k] * host_b[k * NN + n];
+            }
+            expected[m * NN + n] = acc;
+        }
+    }
+
+    std::cout << "Result (" << OUT_N << " elements):\n  ";
+    for (size_t i = 0; i < OUT_N; ++i) {
         std::cout << host_out[i] << " ";
     }
     std::cout << "\nExpected:\n  ";
-    for (int i = 0; i < 8; ++i) {
-        std::cout << (host_lhs[i] + host_rhs[i]) << " ";
+    for (size_t i = 0; i < OUT_N; ++i) {
+        std::cout << expected[i] << " ";
     }
     std::cout << "\n";
 
