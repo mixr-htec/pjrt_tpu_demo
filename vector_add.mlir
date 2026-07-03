@@ -7,7 +7,7 @@
 // sublane dimension.
 //
 // Layout (libtpu 0.23 syntax):
-//     #tpu.tiled<2,(8,128)>          rank=2, single tile (8,128)
+//     #tpu.tiled<(8,128),[1,1]>          rank=2, single tile (8,128)
 //     #tpu.memory_space<vmem>
 //
 // Inner uses get a layout-erased memref via tpu.erase_memref_layout
@@ -15,18 +15,18 @@
 
 module {
   func.func @main(
-      %lhs_tiled: memref<8x128xf32, #tpu.tiled<2,(8,128)>, #tpu.memory_space<vmem>>,
-      %rhs_tiled: memref<8x128xf32, #tpu.tiled<2,(8,128)>, #tpu.memory_space<vmem>>,
-      %dst_tiled: memref<8x128xf32, #tpu.tiled<2,(8,128)>, #tpu.memory_space<vmem>>
+      %lhs_tiled: memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>,
+      %rhs_tiled: memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>,
+      %dst_tiled: memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>
   ) {
     %lhs = tpu.erase_memref_layout %lhs_tiled
-        : memref<8x128xf32, #tpu.tiled<2,(8,128)>, #tpu.memory_space<vmem>>
+        : memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>
        -> memref<8x128xf32, #tpu.memory_space<vmem>>
     %rhs = tpu.erase_memref_layout %rhs_tiled
-        : memref<8x128xf32, #tpu.tiled<2,(8,128)>, #tpu.memory_space<vmem>>
+        : memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>
        -> memref<8x128xf32, #tpu.memory_space<vmem>>
     %dst = tpu.erase_memref_layout %dst_tiled
-        : memref<8x128xf32, #tpu.tiled<2,(8,128)>, #tpu.memory_space<vmem>>
+        : memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>
        -> memref<8x128xf32, #tpu.memory_space<vmem>>
 
     %c0 = arith.constant 0 : index
