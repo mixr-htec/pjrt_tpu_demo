@@ -19,7 +19,7 @@
 //   PJRT_Buffer* output
 //       |
 //       v  PJRT_Buffer_ToHostBuffer
-//   host float[128]
+//   host float[4099]
 //
 // The only compile-time dependency is xla/pjrt/c/pjrt_c_api.h (plain C).
 // The runtime dependency is the PJRT-exporting TPU shared library
@@ -160,14 +160,14 @@ std::string WrapMosaicInStableHlo(const std::string& mosaic_text) {
     return
         "module @wrapper {\n"
         "  func.func @main(\n"
-        "      %lhs: tensor<3x3xf32>,\n"      // A
-        "      %rhs: tensor<3x3xf32>\n"       // B
-        "  ) -> tensor<3x3xf32> {\n"
+        "      %lhs: tensor<4099xf32>,\n"     // A
+        "      %rhs: tensor<4099xf32>\n"      // B
+        "  ) -> tensor<4099xf32> {\n"
         "    %out = stablehlo.custom_call @tpu_custom_call(%lhs, %rhs) {\n"
         "      backend_config = \"" + json + "\",\n"
         "      api_version = 2 : i32\n"
-        "    } : (tensor<3x3xf32>, tensor<3x3xf32>) -> tensor<3x3xf32>\n"
-        "    return %out : tensor<3x3xf32>\n"
+        "    } : (tensor<4099xf32>, tensor<4099xf32>) -> tensor<4099xf32>\n"
+        "    return %out : tensor<4099xf32>\n"
         "  }\n"
         "}\n";
 }
@@ -433,30 +433,23 @@ int main(int argc, char** argv) {
     }
 
     // ---- 7. Prepare host-side inputs ----------------------------------
-    // Compute C = A @ B, with A (M x K) and B (K x N), all 3x3.
-    constexpr size_t M = 3;   // A rows / C rows
-    constexpr size_t K = 3;   // shared (contraction) dim
-    constexpr size_t NN = 3;  // B cols / C cols
+    // Compute D = A + B (elementwise), with A, B, D each a rank-1 4099-vector.
+    constexpr size_t N = 4099;  // vector length
 
-    // A is row-major M x K, B is row-major K x N. Fill A[m][k] = m+1 (constant
-    // across k) and B[k][n] = n+1 (constant across k). Then
-    //   C[m][n] = sum_{k=0..K-1} (m+1)(n+1) = K*(m+1)(n+1) = 3*(m+1)(n+1).
-    std::vector<float> host_a(M * K), host_b(K * NN);
-    for (size_t m = 0; m < M; ++m)
-        for (size_t k = 0; k < K; ++k)
-            host_a[m * K + k] = static_cast<float>(m + 1);
-    for (size_t k = 0; k < K; ++k)
-        for (size_t n = 0; n < NN; ++n)
-            host_b[k * NN + n] = static_cast<float>(n + 1);
+    // Fill A[i] = i and B[i] = 2*i, so D[i] = A[i] + B[i] = 3*i.
+    std::vector<float> host_a(N), host_b(N);
+    for (size_t i = 0; i < N; ++i) {
+        host_a[i] = static_cast<float>(i);
+        host_b[i] = static_cast<float>(2 * i);
+    }
 
     // ---- 8. Upload inputs to device -----------------------------------
-    // Wrapper params are tensor<3x3xf32> (A) and tensor<3x3xf32> (B), so
-    // upload 2D buffers. PJRT/XLA applies the native tiled layout (T(8,128))
-    // and handles any padding on device; the host data stays dense row-major.
-    auto upload = [&](const std::vector<float>& host_data, int rows, int cols)
+    // Wrapper params are tensor<4099xf32> (A) and tensor<4099xf32> (B), so
+    // upload rank-1 buffers. PJRT/XLA applies the native layout and handles
+    // any padding on device; the host data stays dense.
+    auto upload = [&](const std::vector<float>& host_data, int len)
         -> PJRT_Buffer* {
-        int64_t dims[] = {static_cast<int64_t>(rows),
-                          static_cast<int64_t>(cols)};
+        int64_t dims[] = {static_cast<int64_t>(len)};
 
         PJRT_Client_BufferFromHostBuffer_Args args{};
         args.struct_size =
@@ -465,7 +458,7 @@ int main(int argc, char** argv) {
         args.data = host_data.data();
         args.type = PJRT_Buffer_Type_F32;
         args.dims = dims;
-        args.num_dims = 2;
+        args.num_dims = 1;
         args.byte_strides = nullptr;
         args.num_byte_strides = 0;
         args.host_buffer_semantics =
@@ -487,11 +480,11 @@ int main(int argc, char** argv) {
         return args.buffer;
     };
 
-    PJRT_Buffer* buf_lhs = upload(host_a, M, K);   // A (3x3)
-    PJRT_Buffer* buf_rhs = upload(host_b, K, NN);  // B (3x3)
+    PJRT_Buffer* buf_lhs = upload(host_a, N);   // A (4099)
+    PJRT_Buffer* buf_rhs = upload(host_b, N);   // B (4099)
     if (buf_lhs == nullptr || buf_rhs == nullptr) return 1;
-    std::cout << "[7] Uploaded A (" << M << "x" << K << ") and B ("
-              << K << "x" << NN << ") to device\n";
+    std::cout << "[7] Uploaded A (" << N << ") and B (" << N
+              << ") to device\n";
 
     // ---- 9. Execute ---------------------------------------------------
     PJRT_Buffer* output_buffers[1] = {nullptr};
@@ -550,12 +543,12 @@ int main(int argc, char** argv) {
                        "PJRT_Buffer_ToHostBuffer (size probe)")) {
             std::cout << "[dbg] PJRT wants dst_size = " << probe.dst_size
                       << " bytes (" << probe.dst_size / sizeof(float)
-                      << " floats); we allocated " << (3 * 3) << " floats\n";
+                      << " floats); we allocated " << N << " floats\n";
         }
     }
 
-    // Output is the (3x3) matmul result, i.e. 9 elements — not N.
-    constexpr size_t OUT_N = 3 * 3;
+    // Output is the elementwise sum, i.e. N == 4099 elements.
+    constexpr size_t OUT_N = N;
     std::vector<float> host_out(OUT_N);
     {
         PJRT_Buffer_ToHostBuffer_Args args{};
@@ -576,26 +569,26 @@ int main(int argc, char** argv) {
     std::cout << "[9] Downloaded output\n\n";
 
     // ---- 11. Show results ---------------------------------------------
-    // Reference C = A @ B on the host (A row-major MxK, B row-major KxN).
-    std::vector<float> expected(M * NN, 0.0f);
-    for (size_t m = 0; m < M; ++m) {
-        for (size_t n = 0; n < NN; ++n) {
-            float acc = 0.0f;
-            for (size_t k = 0; k < K; ++k) {
-                acc += host_a[m * K + k] * host_b[k * NN + n];
-            }
-            expected[m * NN + n] = acc;
-        }
+    // Reference D = A + B (elementwise) on the host.
+    std::vector<float> expected(N, 0.0f);
+    for (size_t i = 0; i < N; ++i) {
+        expected[i] = host_a[i] + host_b[i];
     }
 
+    // Print only the first/last few elements — 4099 is a lot to dump.
+    constexpr size_t kShow = 8;
+    auto print_slice = [&](const std::vector<float>& v) {
+        for (size_t i = 0; i < kShow && i < OUT_N; ++i)
+            std::cout << v[i] << " ";
+        std::cout << "... ";
+        for (size_t i = (OUT_N > kShow ? OUT_N - kShow : 0); i < OUT_N; ++i)
+            std::cout << v[i] << " ";
+    };
+
     std::cout << "Result (" << OUT_N << " elements):\n  ";
-    for (size_t i = 0; i < OUT_N; ++i) {
-        std::cout << host_out[i] << " ";
-    }
+    print_slice(host_out);
     std::cout << "\nExpected:\n  ";
-    for (size_t i = 0; i < OUT_N; ++i) {
-        std::cout << expected[i] << " ";
-    }
+    print_slice(expected);
     std::cout << "\n";
 
     // ---- 12. Cleanup --------------------------------------------------

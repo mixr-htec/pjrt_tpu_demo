@@ -15,28 +15,18 @@
 
 module {
   func.func @main(
-      %lhs_tiled: memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>,
-      %rhs_tiled: memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>,
-      %dst_tiled: memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>
+      %lhs: memref<4099xf32>, #tpu.memory_space<vmem>>,
+      %rhs: memref<4099xf32>, #tpu.memory_space<vmem>>,
+      %dst: memref<4099xf32>, #tpu.memory_space<vmem>>
   ) {
-    %lhs = tpu.erase_memref_layout %lhs_tiled
-        : memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>
-       -> memref<8x128xf32, #tpu.memory_space<vmem>>
-    %rhs = tpu.erase_memref_layout %rhs_tiled
-        : memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>
-       -> memref<8x128xf32, #tpu.memory_space<vmem>>
-    %dst = tpu.erase_memref_layout %dst_tiled
-        : memref<8x128xf32, #tpu.tiled<(8,128),[1,1]>, #tpu.memory_space<vmem>>
-       -> memref<8x128xf32, #tpu.memory_space<vmem>>
-
     %c0 = arith.constant 0 : index
     %v_lhs = vector.load %lhs[%c0, %c0]
-        : memref<8x128xf32, #tpu.memory_space<vmem>>, vector<8x128xf32>
+        : memref<4099xf32, #tpu.memory_space<vmem>>, vector<4099xf32>
     %v_rhs = vector.load %rhs[%c0, %c0]
-        : memref<8x128xf32, #tpu.memory_space<vmem>>, vector<8x128xf32>
-    %v_sum = arith.addf %v_lhs, %v_rhs : vector<8x128xf32>
+        : memref<4099xf32, #tpu.memory_space<vmem>>, vector<4099xf32>
+    %v_sum = arith.addf %v_lhs, %v_rhs : vector<4099xf32>
     vector.store %v_sum, %dst[%c0, %c0]
-        : memref<8x128xf32, #tpu.memory_space<vmem>>, vector<8x128xf32>
+        : memref<4099xf32, #tpu.memory_space<vmem>>, vector<4099xf32>
     return
   }
 }
