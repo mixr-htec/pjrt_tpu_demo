@@ -39,26 +39,26 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-def mul_kernel(x_ref, y_ref, o_ref):
-    o_ref[...] = x_ref[...] @ y_ref[...]
+def slice_kernel(x_ref, o_ref):
+    o_ref[...] = x_ref[0:2, 0:2, 8:11, 111:211]
 
-x = jnp.arange(9, dtype=jnp.float32).reshape((3, 3))
-
-y = jnp.ones((3, 3), dtype=jnp.float32)
+x = jnp.arange(3 * 3 * 14 * 216, dtype=jnp.float32).reshape((3, 3, 14, 216))
 
 result = pl.pallas_call(
-    mul_kernel,
-    out_shape=jax.ShapeDtypeStruct((3,3,), jnp.float32),
+    slice_kernel,
+    out_shape=jax.ShapeDtypeStruct((2, 2, 3, 100), jnp.float32),
     debug=True,
-)(x, y)
+)(x)
 
 result.block_until_ready()
 
-expected = x @ y
+expected = x[0:2, 0:2, 8:11, 111:211]
 
-print("result[:9] =", result[:9])
+print("match =", jnp.allclose(result, expected))
 
-print("expected[:9] =", expected[:9])
+print("result[0, 0, :8] =", result[0, 0, :8])
+
+print("expected[0, 0, :8] =", expected[0, 0, :8])
 
 print(f"\nDumps written to:")
 
